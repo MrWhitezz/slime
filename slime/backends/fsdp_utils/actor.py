@@ -159,6 +159,14 @@ class FSDPTrainRayActor(TrainRayActor):
                         device=torch.cuda.current_device(),
                     ),
                     "raw_reward": rollout_data["raw_reward"][i : i + self.args.micro_batch_size],
+                    # carry through rollout_log_probs for TIS if present
+                    **(
+                        {
+                            "rollout_log_probs": rollout_data["rollout_log_probs"][i : i + self.args.micro_batch_size]
+                        }
+                        if "rollout_log_probs" in rollout_data
+                        else {}
+                    ),
                 }
             )
         return padded_batches
@@ -237,10 +245,30 @@ class FSDPTrainRayActor(TrainRayActor):
             pg_clipfrac = per_sample_mean(pg_clipfrac, batch["loss_masks"])
             ppo_kl = per_sample_mean(ppo_kl.abs(), batch["loss_masks"])
 
-            loss = pg_loss
-
             if self.args.use_tis:
-                raise NotImplementedError("implement TIS")
+                # rollout_log_probs must be provided by rollout engines and carried in batch
+                assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
+
+                # concatenate per-sample tensors to single vector
+                rollout_log_probs = (
+                    torch.cat(batch["rollout_log_probs"], dim=0) if isinstance(batch["rollout_log_probs"][0], torch.Tensor) else torch.tensor(batch["rollout_log_probs"], device=log_probs.device)
+                )
+                old_log_probs = torch.cat(batch["log_probs"], dim=0)
+
+                # importance sampling ratios
+                tis = torch.exp(old_log_probs - rollout_log_probs)
+                ois = (-ppo_kl).exp()
+
+                # clipped TIS
+                tis_clip = torch.clamp(tis, min=self.args.tis_clip_low, max=self.args.tis_clip)
+                tis_clipfrac = tis_clip != tis
+
+                # apply TIS correction to per-token policy loss
+                # pg_loss and pg_clipfrac are per-token tensors aligned with advantages
+                pg_loss = pg_loss * tis_clip
+
+            # final loss is (possibly TIS-corrected) policy loss
+            loss = pg_loss
 
             if self.args.entropy_coef != 0:
                 raise NotImplementedError("implement entropy bonus")
@@ -263,6 +291,12 @@ class FSDPTrainRayActor(TrainRayActor):
             }
             if self.args.use_kl_loss:
                 reported["kl_loss"] = kl_loss.detach()
+
+            if self.args.use_tis:
+                # log TIS / OIS metrics (mean over samples will be computed later)
+                reported["tis"] = tis.detach()
+                reported["ois"] = ois.detach()
+                reported["tis_clipfrac"] = tis_clipfrac.detach()
 
             # Scale loss for gradient accumulation
             loss = loss / grad_accum
