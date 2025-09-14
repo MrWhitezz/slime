@@ -253,7 +253,7 @@ class FSDPTrainRayActor(TrainRayActor):
                 rollout_log_probs = (
                     torch.cat(batch["rollout_log_probs"], dim=0) if isinstance(batch["rollout_log_probs"][0], torch.Tensor) else torch.tensor(batch["rollout_log_probs"], device=log_probs.device)
                 )
-                old_log_probs = torch.cat(batch["log_probs"], dim=0)
+                old_log_probs = batch["log_probs"]
 
                 # importance sampling ratios
                 tis = torch.exp(old_log_probs - rollout_log_probs)
