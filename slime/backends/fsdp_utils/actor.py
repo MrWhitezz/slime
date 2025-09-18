@@ -149,26 +149,42 @@ class FSDPTrainRayActor(TrainRayActor):
                 [0] * (len(t) - len(l) - 1) + l + [0] * (max_len - len(t))
                 for l, t in zip(batch_loss_masks, batch_tokens)
             ]
-            padded_batches.append(
-                {
-                    "tokens": torch.tensor(padded_tokens, dtype=torch.long, device=torch.cuda.current_device()),
-                    "loss_masks": torch.tensor(padded_loss_masks, dtype=torch.int, device=torch.cuda.current_device()),
-                    "rewards": torch.tensor(
-                        rollout_data["rewards"][i : i + self.args.micro_batch_size],
-                        dtype=torch.float,
-                        device=torch.cuda.current_device(),
-                    ),
-                    "raw_reward": rollout_data["raw_reward"][i : i + self.args.micro_batch_size],
-                    # carry through rollout_log_probs for TIS if present
-                    **(
-                        {
-                            "rollout_log_probs": rollout_data["rollout_log_probs"][i : i + self.args.micro_batch_size]
-                        }
-                        if "rollout_log_probs" in rollout_data
-                        else {}
-                    ),
-                }
-            )
+            
+            # Pad rollout_log_probs if present to match the padded tokens shape
+            batch_data = {
+                "tokens": torch.tensor(padded_tokens, dtype=torch.long, device=torch.cuda.current_device()),
+                "loss_masks": torch.tensor(padded_loss_masks, dtype=torch.int, device=torch.cuda.current_device()),
+                "rewards": torch.tensor(
+                    rollout_data["rewards"][i : i + self.args.micro_batch_size],
+                    dtype=torch.float,
+                    device=torch.cuda.current_device(),
+                ),
+                "raw_reward": rollout_data["raw_reward"][i : i + self.args.micro_batch_size],
+            }
+            
+            if "rollout_log_probs" in rollout_data:
+                batch_rollout_log_probs = rollout_data["rollout_log_probs"][i : i + self.args.micro_batch_size]
+                padded_rollout_log_probs = []
+                for j, sample_rollout_log_probs in enumerate(batch_rollout_log_probs):
+                    # Target length should be max_len - 1 (same as log_probs)
+                    target_len = max_len - 1
+                    if isinstance(sample_rollout_log_probs, (list, tuple)):
+                        sample_tensor = torch.tensor(sample_rollout_log_probs, dtype=torch.float32)
+                    else:
+                        sample_tensor = sample_rollout_log_probs.float()
+                    
+                    # Pad or truncate to target_len
+                    if len(sample_tensor) >= target_len:
+                        padded_sample = sample_tensor[:target_len]
+                    else:
+                        # Pad with zeros (will be masked out by loss_mask anyway)
+                        pad_len = target_len - len(sample_tensor)
+                        padded_sample = torch.cat([sample_tensor, torch.zeros(pad_len, dtype=torch.float32)])
+                    padded_rollout_log_probs.append(padded_sample)
+                
+                batch_data["rollout_log_probs"] = torch.stack(padded_rollout_log_probs, dim=0).to(torch.cuda.current_device())
+            
+            padded_batches.append(batch_data)
         return padded_batches
 
     def train(self, rollout_id, rollout_data_ref):  # type: ignore[override]
@@ -241,18 +257,12 @@ class FSDPTrainRayActor(TrainRayActor):
                 ppo_kl, batch["advantages"], self.args.eps_clip, self.args.eps_clip_high
             )
 
-            pg_loss = per_sample_mean(pg_loss, batch["loss_masks"])
-            pg_clipfrac = per_sample_mean(pg_clipfrac, batch["loss_masks"])
-            ppo_kl = per_sample_mean(ppo_kl.abs(), batch["loss_masks"])
-
             if self.args.use_tis:
                 # rollout_log_probs must be provided by rollout engines and carried in batch
                 assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
 
-                # concatenate per-sample tensors to single vector
-                rollout_log_probs = (
-                    torch.cat(batch["rollout_log_probs"], dim=0) if isinstance(batch["rollout_log_probs"][0], torch.Tensor) else torch.tensor(batch["rollout_log_probs"], device=log_probs.device)
-                )
+                # Now both are 2D tensors with same shape [batch_size, seq_len-1]
+                rollout_log_probs = batch["rollout_log_probs"]
                 old_log_probs = batch["log_probs"]
 
                 # importance sampling ratios
@@ -264,8 +274,11 @@ class FSDPTrainRayActor(TrainRayActor):
                 tis_clipfrac = tis_clip != tis
 
                 # apply TIS correction to per-token policy loss
-                # pg_loss and pg_clipfrac are per-token tensors aligned with advantages
                 pg_loss = pg_loss * tis_clip
+
+            pg_loss = per_sample_mean(pg_loss, batch["loss_masks"])
+            pg_clipfrac = per_sample_mean(pg_clipfrac, batch["loss_masks"])
+            ppo_kl = per_sample_mean(ppo_kl.abs(), batch["loss_masks"])
 
             # final loss is (possibly TIS-corrected) policy loss
             loss = pg_loss
@@ -294,9 +307,9 @@ class FSDPTrainRayActor(TrainRayActor):
 
             if self.args.use_tis:
                 # log TIS / OIS metrics (mean over samples will be computed later)
-                reported["tis"] = tis.detach()
-                reported["ois"] = ois.detach()
-                reported["tis_clipfrac"] = tis_clipfrac.detach()
+                reported["tis"] = per_sample_mean(tis, batch["loss_masks"]).detach()
+                reported["ois"] = per_sample_mean(ois, batch["loss_masks"]).detach()
+                reported["tis_clipfrac"] = per_sample_mean(tis_clipfrac.float(), batch["loss_masks"]).detach()
 
             # Scale loss for gradient accumulation
             loss = loss / grad_accum
